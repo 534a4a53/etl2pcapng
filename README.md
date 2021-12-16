@@ -1,4 +1,9 @@
 
+# Why this is forked
+
+To have a copy of the repo for when Microsoft goes full EEE on the Open Souce software in their stack
+And to put the MSI of the bad Windows Wireshark Clone that is EOL 
+
 # About
 
 This tool enables you to view ndiscap packet captures with Wireshark.
