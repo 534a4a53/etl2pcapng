@@ -31,16 +31,435 @@ Issues:
 #include <strsafe.h>
 #include <winsock2.h>
 #include <netiodef.h>
-#include <pcapng.h>
-
-#define USAGE \
-"etl2pcapng <infile> <outfile>\n" \
-"Converts a packet capture from etl to pcapng format.\n"
 
 // Increment when adding features
-#define VERSION "1.8.0"
+#define VERSION "1.11.0"
+
+#define USAGE \
+"etl2pcapng version " VERSION "\n" \
+"   Converts a packet capture from etl to pcapng format.\n" \
+"Usage:\n" \
+"   etl2pcapng in.etl out.pcapng\n" \
+"   or\n" \
+"   etl2pcapng in.etl\n"
+
+// Default extension for output files
+#define DEFAULT_OUT_FILE_EXTENSION L".pcapng"
+
+// A write buffer to reduce the number of calls to WriteFile to improve performance.
+// BufferBytes is called each time that WriteFile would normally be called; then
+// at the end FlushBufferBytes is called once.
+
+#define WRITEBUF_SIZE 500000
+char WriteBuf[WRITEBUF_SIZE];
+unsigned long WriteBufNext = 0; // The offset of the next byte to be written into the buffer.
+
+BOOLEAN BufferBytes(HANDLE File, void* Buf, unsigned long BufSize)
+{
+    unsigned long CurSpace = WRITEBUF_SIZE - WriteBufNext;
+
+    if (BufSize > CurSpace && CurSpace < WRITEBUF_SIZE) {
+        // Flush write buffer to make space for the new bytes.
+        if (!WriteFile(File, WriteBuf, WriteBufNext, NULL, NULL)) {
+            return FALSE;
+        }
+        WriteBufNext = 0;
+        CurSpace = WRITEBUF_SIZE;
+    }
+
+    if (BufSize > CurSpace) {
+        // The buffer is empty and we still don't have enough space.
+        // Bypass the buffer and write directly to the file.
+        if (!WriteFile(File, Buf, BufSize, NULL, NULL)) {
+            return FALSE;
+        }
+    } else {
+        memcpy(WriteBuf + WriteBufNext, (char*)Buf, BufSize);
+        WriteBufNext += BufSize;
+    }
+
+    return TRUE;
+}
+
+BOOLEAN FlushBufferBytes(HANDLE File)
+{
+    if (!WriteFile(File, WriteBuf, WriteBufNext, NULL, NULL)) {
+        return FALSE;
+    }
+    WriteBufNext = 0;
+
+    return TRUE;
+}
+
+// Helpers for working with .pcapng files.
+// https://github.com/pcapng/pcapng
+
+#pragma warning(disable:4200) // zero-sized array
+
+#define PCAPNG_BLOCKTYPE_SECTION_HEADER  0x0a0d0d0a
+#define PCAPNG_BLOCKTYPE_INTERFACEDESC   0x00000001
+#define PCAPNG_BLOCKTYPE_ENHANCED_PACKET 0x00000006
+
+#define PCAPNG_OPTIONCODE_ENDOFOPT  0
+#define PCAPNG_OPTIONCODE_COMMENT   1
+#define PCAPNG_OPTIONCODE_EPB_FLAGS 2
+#define PCAPNG_OPTIONCODE_IDB_IF_NAME 2
+#define PCAPNG_OPTIONCODE_IDB_IF_DESC 3
+
+#define PCAPNG_LINKTYPE_ETHERNET    1
+#define PCAPNG_LINKTYPE_RAW         101
+#define PCAPNG_LINKTYPE_IEEE802_11  105
+
+#define PCAPNG_SECTION_HEADER_MAGIC 0x1a2b3c4d // for byte order detection
+
+#define PAD_TO_32BIT(x) ((4 - ((x) & 3)) & 3)
+
+#include <pshpack1.h>
+struct PCAPNG_BLOCK_HEAD {
+    unsigned long Type;
+    unsigned long Length;
+};
+struct PCAPNG_SECTION_HEADER_BODY {
+    unsigned long  Magic; // endian detection (set this to PCAPNG_SECTION_HEADER_MAGIC)
+    unsigned short MajorVersion;
+    unsigned short MinorVersion;
+    long long      Length;
+};
+struct PCAPNG_INTERFACE_DESC_BODY {
+    unsigned short LinkType;
+    unsigned short Reserved;
+    unsigned long  SnapLen;
+};
+struct PCAPNG_ENHANCED_PACKET_BODY {
+    unsigned long InterfaceId;
+    unsigned long TimeStampHigh;
+    unsigned long TimeStampLow;
+    unsigned long CapturedLength; // excludes padding
+    unsigned long PacketLength;   // excludes padding
+    unsigned char PacketData[0];  // padded to 4 bytes
+};
+struct PCAPNG_BLOCK_OPTION_ENDOFOPT {
+    unsigned short Code;          // PCAPNG_OPTIONCODE_ENDOFOPT
+    unsigned short Length;        // 0
+};
+struct PCAPNG_BLOCK_OPTION_EPB_FLAGS {
+    unsigned short Code;          // PCAPNG_OPTIONCODE_EPB_FLAGS
+    unsigned short Length;        // 4
+    unsigned long  Value;
+};
+struct PCAPNG_BLOCK_OPTION_VAR_LENGTH {
+    unsigned short Code;
+    unsigned short Length;
+};
+struct PCAPNG_BLOCK_TAIL {
+    unsigned long Length;         // Same as PCAPNG_BLOCK_HEAD.Length, for easier backward processing.
+};
+#include <poppack.h>
+
+struct PCAPNG_BLOCK_OPTION_ENDOFOPT EndOption = { .Code = PCAPNG_OPTIONCODE_ENDOFOPT, .Length = 0};
+
+inline int
+PcapNgWriteSectionHeader(
+    HANDLE File
+    )
+{
+    int Err = NO_ERROR;
+    struct PCAPNG_BLOCK_HEAD Head;
+    struct PCAPNG_SECTION_HEADER_BODY Body;
+    struct PCAPNG_BLOCK_TAIL Tail;
+    int TotalLength = sizeof(Head) + sizeof(Body) + sizeof(Tail);
+
+    Head.Type = PCAPNG_BLOCKTYPE_SECTION_HEADER;
+    Head.Length = TotalLength;
+    if (!BufferBytes(File, &Head, sizeof(Head))) {
+        Err = GetLastError();
+        printf("WriteFile failed with %u\n", Err);
+        goto Done;
+    }
+
+    Body.Magic = PCAPNG_SECTION_HEADER_MAGIC;
+    Body.MajorVersion = 1;
+    Body.MinorVersion = 0;
+    Body.Length = -1;
+    if (!BufferBytes(File, &Body, sizeof(Body))) {
+        Err = GetLastError();
+        printf("WriteFile failed with %u\n", Err);
+        goto Done;
+    }
+
+    Tail.Length = TotalLength;
+    if (!BufferBytes(File, &Tail, sizeof(Tail))) {
+        Err = GetLastError();
+        printf("WriteFile failed with %u\n", Err);
+        goto Done;
+    }
+
+Done:
+
+    return Err;
+}
+
+inline int
+PcapNgWriteInterfaceDesc(
+    HANDLE File,
+    short LinkType,
+    long SnapLen,
+    char* IfName,
+    unsigned short IfNameLength,
+    char* IfDesc,
+    unsigned short IfDescLength
+    )
+{
+    int Err = NO_ERROR;
+    struct PCAPNG_BLOCK_HEAD Head;
+    struct PCAPNG_INTERFACE_DESC_BODY Body;
+    struct PCAPNG_BLOCK_TAIL Tail;
+    struct PCAPNG_BLOCK_OPTION_VAR_LENGTH IfNameOpt;
+    struct PCAPNG_BLOCK_OPTION_VAR_LENGTH IfDescOpt;
+    char Pad[4] = { 0 };
+
+    int TotalLength = sizeof(Head) + sizeof(Body) + sizeof(Tail);
+
+    if (IfName != NULL) {
+        IfNameOpt.Code = PCAPNG_OPTIONCODE_IDB_IF_NAME;
+        IfNameOpt.Length = IfNameLength;
+        TotalLength += sizeof(IfNameOpt) + IfNameLength + PAD_TO_32BIT(IfNameLength);
+    }
+
+    if (IfDesc != NULL) {
+        IfDescOpt.Code = PCAPNG_OPTIONCODE_IDB_IF_DESC;
+        IfDescOpt.Length = IfDescLength;
+        TotalLength += sizeof(IfDescOpt) + IfDescLength + PAD_TO_32BIT(IfDescLength);
+    }
+
+    if (IfName != NULL || IfDesc != NULL) {
+        TotalLength += sizeof(EndOption);
+    }
+
+    Head.Type = PCAPNG_BLOCKTYPE_INTERFACEDESC;
+    Head.Length = TotalLength;
+    if (!BufferBytes(File, &Head, sizeof(Head))) {
+        Err = GetLastError();
+        printf("WriteFile failed with %u\n", Err);
+        goto Done;
+    }
+
+    Body.LinkType = LinkType;
+    Body.Reserved = 0;
+    Body.SnapLen = SnapLen;
+    if (!BufferBytes(File, &Body, sizeof(Body))) {
+        Err = GetLastError();
+        printf("WriteFile failed with %u\n", Err);
+        goto Done;
+    }
+
+    if (IfName != NULL) {
+        if (!BufferBytes(File, &IfNameOpt, sizeof(IfNameOpt))) {
+            Err = GetLastError();
+            printf("WriteFile failed with %u\n", Err);
+            goto Done;
+        }
+
+        if (!BufferBytes(File, IfName, IfNameLength)) {
+            Err = GetLastError();
+            printf("WriteFile failed with %u\n", Err);
+            goto Done;
+        }
+
+        if (PAD_TO_32BIT(IfNameLength) > 0) {
+            if (!BufferBytes(File, Pad, PAD_TO_32BIT(IfNameLength))) {
+                Err = GetLastError();
+                printf("WriteFile failed with %u\n", Err);
+                goto Done;
+            }
+        }
+    }
+
+    if (IfDesc != NULL) {
+        if (!BufferBytes(File, &IfDescOpt, sizeof(IfDescOpt))) {
+            Err = GetLastError();
+            printf("WriteFile failed with %u\n", Err);
+            goto Done;
+        }
+
+        if (!BufferBytes(File, IfDesc, IfDescLength)) {
+            Err = GetLastError();
+            printf("WriteFile failed with %u\n", Err);
+            goto Done;
+        }
+
+        if (PAD_TO_32BIT(IfDescLength) > 0) {
+            if (!BufferBytes(File, Pad, PAD_TO_32BIT(IfDescLength))) {
+                Err = GetLastError();
+                printf("WriteFile failed with %u\n", Err);
+                goto Done;
+            }
+        }
+    }
+
+    if (!BufferBytes(File, &EndOption, sizeof(EndOption))) {
+        Err = GetLastError();
+        printf("WriteFile failed with %u\n", Err);
+        goto Done;
+    }
+
+    Tail.Length = TotalLength;
+    if (!BufferBytes(File, &Tail, sizeof(Tail))) {
+        Err = GetLastError();
+        printf("WriteFile failed with %u\n", Err);
+        goto Done;
+    }
+
+Done:
+
+    return Err;
+}
+
+inline int
+PcapNgWriteCommentOption(
+    HANDLE File,
+    PCHAR CommentBuffer,
+    unsigned short CommentLength,
+    int CommentPadLength
+    )
+{
+    int Err = NO_ERROR;
+    struct PCAPNG_BLOCK_OPTION_VAR_LENGTH Comment;
+    char Pad[4] = { 0 };
+
+    Comment.Code = PCAPNG_OPTIONCODE_COMMENT;
+    Comment.Length = CommentLength;
+
+    if (!BufferBytes(File, &Comment, sizeof(Comment))) {
+        Err = GetLastError();
+        printf("WriteFile failed with %u\n", Err);
+        goto Done;
+    }
+    if (!BufferBytes(File, CommentBuffer, CommentLength)) {
+        Err = GetLastError();
+        printf("WriteFile failed with %u\n", Err);
+        goto Done;
+    }
+    if (CommentPadLength > 0) {
+        if (!BufferBytes(File, Pad, CommentPadLength)) {
+            Err = GetLastError();
+            printf("WriteFile failed with %u\n", Err);
+            goto Done;
+        }
+    }
+
+Done:
+
+    return Err;
+}
+
+inline int
+PcapNgWriteEnhancedPacket(
+    HANDLE File,
+    char* FragBuf,
+    unsigned long FragLength,
+    unsigned long OrigFragLength,
+    long InterfaceId,
+    long IsSend,
+    long TimeStampHigh, // usec (unless if_tsresol is used)
+    long TimeStampLow,
+    char* Comment,
+    unsigned short CommentLength
+    )
+{
+    int Err = NO_ERROR;
+    struct PCAPNG_BLOCK_HEAD Head;
+    struct PCAPNG_ENHANCED_PACKET_BODY Body;
+    struct PCAPNG_BLOCK_OPTION_EPB_FLAGS EpbFlagsOption;
+    struct PCAPNG_BLOCK_TAIL Tail;
+    char Pad[4] = {0};
+    BOOLEAN CommentProvided = (CommentLength > 0 && Comment != NULL);
+    int CommentPadLength = PAD_TO_32BIT(CommentLength);
+    int FragPadLength = PAD_TO_32BIT(sizeof(Body) + FragLength);
+    int TotalLength =
+        sizeof(Head) + sizeof(Body) + FragLength + FragPadLength +
+        sizeof(EpbFlagsOption) + sizeof(EndOption) + sizeof(Tail) +
+        (CommentProvided ?
+            sizeof(struct PCAPNG_BLOCK_OPTION_VAR_LENGTH) + CommentLength + CommentPadLength : 0);
+
+    Head.Type = PCAPNG_BLOCKTYPE_ENHANCED_PACKET;
+    Head.Length = TotalLength;
+    if (!BufferBytes(File, &Head, sizeof(Head))) {
+        Err = GetLastError();
+        printf("WriteFile failed with %u\n", Err);
+        goto Done;
+    }
+
+    Body.InterfaceId = InterfaceId;
+    Body.TimeStampHigh = TimeStampHigh;
+    Body.TimeStampLow = TimeStampLow;
+    Body.PacketLength = OrigFragLength; // original length
+    Body.CapturedLength = FragLength; // truncated length
+    if (!BufferBytes(File, &Body, sizeof(Body))) {
+        Err = GetLastError();
+        printf("WriteFile failed with %u\n", Err);
+        goto Done;
+    }
+    if (!BufferBytes(File, FragBuf, FragLength)) {
+        Err = GetLastError();
+        printf("WriteFile failed with %u\n", Err);
+        goto Done;
+    }
+    if (FragPadLength > 0) {
+        if (!BufferBytes(File, Pad, FragPadLength)) {
+            Err = GetLastError();
+            printf("WriteFile failed with %u\n", Err);
+            goto Done;
+        }
+    }
+
+    EpbFlagsOption.Code = PCAPNG_OPTIONCODE_EPB_FLAGS;
+    EpbFlagsOption.Length = 4;
+    EpbFlagsOption.Value = IsSend ? 2 : 1;
+    if (!BufferBytes(File, &EpbFlagsOption, sizeof(EpbFlagsOption))) {
+        Err = GetLastError();
+        printf("WriteFile failed with %u\n", Err);
+        goto Done;
+    }
+
+    if (CommentProvided) {
+        Err = PcapNgWriteCommentOption(
+            File,
+            Comment,
+            CommentLength,
+            CommentPadLength);
+        if (Err != NO_ERROR) {
+            goto Done;
+        }
+    }
+
+    if (!BufferBytes(File, &EndOption, sizeof(EndOption))) {
+        Err = GetLastError();
+        printf("WriteFile failed with %u\n", Err);
+        goto Done;
+    }
+
+    Tail.Length = TotalLength;
+    if (!BufferBytes(File, &Tail, sizeof(Tail))) {
+        Err = GetLastError();
+        printf("WriteFile failed with %u\n", Err);
+        goto Done;
+    }
+
+Done:
+
+    return Err;
+}
+
+// End pcapng helpers.
 
 #define MAX_PACKET_SIZE 65535
+
+// 2 characters for each byte in the GUID structure{ ulong, ushort, ushort, uchar[8] }
+// 4 hypen characters '-'
+// Open / Close curly braces
+// Zero terminator.
+#define GUID_STR_SIZE ((sizeof(unsigned long) + sizeof(unsigned short) + sizeof(unsigned short) + 8) * 2 + 4 + 2 + 1)
 
 // From the ndiscap manifest
 #define KW_MEDIA_WIRELESS_WAN         0x200
@@ -53,6 +472,8 @@ Issues:
 #define tidPacketFragment            1001
 #define tidPacketMetadata            1002
 #define tidVMSwitchPacketFragment    1003
+#define tidRRasNdisWanSendPckts      5001
+#define tidRRasNdisWanRcvPckts       5002
 
 // From: https://docs.microsoft.com/en-us/windows-hardware/drivers/ddi/windot11/ns-windot11-dot11_extsta_recv_context
 #pragma pack(push,8)
@@ -144,11 +565,28 @@ typedef struct _VMSWITCH_PACKET_FRAGMENT {
     unsigned long RssHashValue;
 } VMSWITCH_PACKET_FRAGMENT, *PVMSWITCH_PACKET_FRAGMENT;
 
-BOOLEAN CurrentPacketIsVMSwitchPacketFragment = FALSE;
+typedef struct _RAS_NDIS_WAN_PACKET_FRAGMENT {
+    char RoutingDomainID[GUID_STR_SIZE];
+    char Username[256];
+    unsigned long InterfacePreHashValue;
+} RAS_NDIS_WAN_PACKET_FRAGMENT, *PRAS_NDIS_WAN_PACKET_FRAGMENT;
+
+typedef struct _RAS_INTERFACE_INFO {
+    char RoutingDomainID[GUID_STR_SIZE];
+    char Username[256];
+} RAS_INTERFACE_INFO, *PRAS_INTERFACE_INFO;
+
+BOOLEAN CurrentPacketIsVMSwitch = FALSE;
 VMSWITCH_PACKET_FRAGMENT VMSwitchPacketFragment;
 
 const GUID NdisCapId = { // Microsoft-Windows-NDIS-PacketCapture {2ED6006E-4729-4609-B423-3EE7BCD678EF}
     0x2ed6006e, 0x4729, 0x4609, 0xb4, 0x23, 0x3e, 0xe7, 0xbc, 0xd6, 0x78, 0xef};
+
+BOOLEAN CurrentPacketIsRas = FALSE;
+RAS_NDIS_WAN_PACKET_FRAGMENT RasNdisWanPacketFragment;
+
+const GUID RasNdisWanCapId = { // Microsoft-Windows-Ras-NdisWanPacketCapture {D84521F7-2235-4237-A7C0-14E3A9676286}
+    0xd84521f7, 0x2235, 0x4237, 0xa7, 0xc0, 0x14, 0xe3, 0xa9, 0x67, 0x62, 0x86};
 
 struct INTERFACE {
     struct INTERFACE* Next;
@@ -160,6 +598,9 @@ struct INTERFACE {
 
     BOOLEAN IsVMNic;
     VMSWITCH_SOURCE_INFO VMNic;
+
+    BOOLEAN IsRas;
+    RAS_INTERFACE_INFO Ras;
 };
 
 #define IFACE_HT_SIZE 100
@@ -168,26 +609,41 @@ unsigned long NumInterfaces = 0;
 
 unsigned long HashInterface(unsigned long LowerIfIndex)
 {
-    if (CurrentPacketIsVMSwitchPacketFragment) {
-        return VMSwitchPacketFragment.SourcePortId * (VMSwitchPacketFragment.VlanId + 1);
+    unsigned long PreHash = 0;
+
+    if (CurrentPacketIsVMSwitch) {
+        PreHash = VMSwitchPacketFragment.SourcePortId * (VMSwitchPacketFragment.VlanId + 1);
+    } else if (CurrentPacketIsRas) {
+        PreHash = RasNdisWanPacketFragment.InterfacePreHashValue;
+        for (unsigned int i = 0; i < strlen(RasNdisWanPacketFragment.Username); i++) {
+            PreHash += RasNdisWanPacketFragment.Username[i] << i;
+        }
     } else {
-        return LowerIfIndex;
+        PreHash = LowerIfIndex;
     }
+    return PreHash % IFACE_HT_SIZE;
 }
 
 struct INTERFACE* GetInterface(unsigned long LowerIfIndex)
 {
-    struct INTERFACE* Iface = InterfaceHashTable[HashInterface(LowerIfIndex) % IFACE_HT_SIZE];
+    struct INTERFACE* Iface = InterfaceHashTable[HashInterface(LowerIfIndex)];
     while (Iface != NULL) {
-        if (CurrentPacketIsVMSwitchPacketFragment) {
+        if (CurrentPacketIsVMSwitch) {
             if (Iface->IsVMNic &&
                 Iface->LowerIfIndex == LowerIfIndex &&
                 Iface->VlanId == VMSwitchPacketFragment.VlanId &&
                 Iface->VMNic.SourcePortId == VMSwitchPacketFragment.SourcePortId) {
                 return Iface;
             }
+        } else if (CurrentPacketIsRas) {
+            if (Iface->IsRas &&
+                Iface->LowerIfIndex == LowerIfIndex &&
+                strcmp(Iface->Ras.RoutingDomainID, RasNdisWanPacketFragment.RoutingDomainID) == 0 &&
+                strcmp(Iface->Ras.Username, RasNdisWanPacketFragment.Username) == 0) {
+                return Iface;
+            }
         } else {
-            if (!Iface->IsVMNic && Iface->LowerIfIndex == LowerIfIndex && Iface->VlanId == 0) {
+            if (!Iface->IsVMNic && !Iface->IsRas && Iface->LowerIfIndex == LowerIfIndex) {
                 return Iface;
             }
         }
@@ -198,7 +654,6 @@ struct INTERFACE* GetInterface(unsigned long LowerIfIndex)
 
 void AddInterface(PEVENT_RECORD ev, unsigned long LowerIfIndex, unsigned long MiniportIfIndex, short Type)
 {
-    struct INTERFACE** Iface = &InterfaceHashTable[HashInterface(LowerIfIndex) % IFACE_HT_SIZE];
     struct INTERFACE* NewIface = malloc(sizeof(struct INTERFACE));
     if (NewIface == NULL) {
         printf("out of memory\n");
@@ -210,19 +665,23 @@ void AddInterface(PEVENT_RECORD ev, unsigned long LowerIfIndex, unsigned long Mi
     NewIface->Type = Type;
     NewIface->VlanId = 0;
     NewIface->IsVMNic = FALSE;
+    NewIface->IsRas = FALSE;
 
-    if (CurrentPacketIsVMSwitchPacketFragment) {
+    wchar_t Buffer[8192];
+    PROPERTY_DATA_DESCRIPTOR Desc;
+    int Err;
+    ULONG ParamNameSize = 0;
 
+    if (CurrentPacketIsRas) {
+        NewIface->IsRas = TRUE;
+        memcpy(NewIface->Ras.RoutingDomainID, RasNdisWanPacketFragment.RoutingDomainID, GUID_STR_SIZE);
+        memcpy(NewIface->Ras.Username, RasNdisWanPacketFragment.Username, sizeof(RasNdisWanPacketFragment.Username));
+    } else if (CurrentPacketIsVMSwitch) {
         NewIface->IsVMNic = TRUE;
-
-        wchar_t Buffer[8192];
-        PROPERTY_DATA_DESCRIPTOR Desc;
-        int Err;
 
         // SourceNicName
         Desc.PropertyName = (unsigned long long)(L"SourceNicName");
         Desc.ArrayIndex = ULONG_MAX;
-        ULONG ParamNameSize = 0;
         (void)TdhGetPropertySize(ev, 0, NULL, 1, &Desc, &ParamNameSize);
         NewIface->VMNic.SourceNicName = malloc((ParamNameSize / sizeof(wchar_t)) + 1);
         if (NewIface->VMNic.SourceNicName == NULL) {
@@ -297,8 +756,8 @@ void AddInterface(PEVENT_RECORD ev, unsigned long LowerIfIndex, unsigned long Mi
         NewIface->VlanId = VMSwitchPacketFragment.VlanId;
     }
 
+    struct INTERFACE** Iface = &InterfaceHashTable[HashInterface(LowerIfIndex)];
     NewIface->Next = *Iface;
-
     *Iface = NewIface;
     NumInterfaces++;
 }
@@ -391,6 +850,21 @@ void WriteInterfaces()
                     Interface->LowerIfIndex,
                     Interface->VlanId
                 );
+            } else if (Interface->IsRas) {
+                printf("IF: medium=Rras-tunnel\t\tID=%u\tIfIndex=%u\tRoutingDomainId=%s\tUsername=%s",
+                    Interface->PcapNgIfIndex,
+                    Interface->LowerIfIndex,
+                    Interface->Ras.RoutingDomainID,
+                    Interface->Ras.Username
+                );
+                StringCchPrintfA(
+                    IfName,
+                    IF_STRING_MAX_SIZE,
+                    "Rras:%u:%s:%s",
+                    Interface->LowerIfIndex,
+                    Interface->Ras.RoutingDomainID,
+                    Interface->Ras.Username
+                );
             } else {
                 printf("IF: medium=eth\t\t\tID=%u\tIfIndex=%u\tVlanID=%i", Interface->PcapNgIfIndex, Interface->LowerIfIndex, Interface->VlanId);
                 StringCchPrintfA(IfName, IF_STRING_MAX_SIZE, "eth:%lu:%i", Interface->LowerIfIndex, Interface->VlanId);
@@ -431,6 +905,64 @@ void WriteInterfaces()
     }
 
     free(InterfaceArray);
+}
+
+void ParseRasNdisWanPacketFragment(PEVENT_RECORD ev)
+{
+    // Parse the current RasNdisWan packet event for use elsewhere.
+    // NB: Here we only do per-packet parsing. For any event fields that only need to be
+    // parsed once and written into an INTERFACE, we do the parsing in AddInterface.
+    ULONG Err;
+    wchar_t Buffer[256];
+    PROPERTY_DATA_DESCRIPTOR Desc;
+    ULONG ParamNameSize = 0;
+    // RoutingDomainID
+    Desc.PropertyName = (unsigned long long)(L"RoutingDomainID");
+    Desc.ArrayIndex = ULONG_MAX;
+    (void)TdhGetPropertySize(ev, 0, NULL, 1, &Desc, &ParamNameSize);
+    if ((ParamNameSize / sizeof(wchar_t)) != GUID_STR_SIZE) {
+        printf("error decoding Microsoft-Windows-Ras-NdisWanPacketCapture: TdhGetPropertySize returns an unexpected RoutingDomainID size\n");
+        return;
+    }
+    Err = TdhGetProperty(ev, 0, NULL, 1, &Desc, sizeof(Buffer), (PBYTE)Buffer);
+    if (Err != NO_ERROR) {
+        Buffer[0] = L'\0';
+    }
+    Buffer[ParamNameSize / sizeof(wchar_t) + 1] = L'\0';
+    WideCharToMultiByte(CP_ACP,
+        0,
+        Buffer,
+        -1,
+        RasNdisWanPacketFragment.RoutingDomainID,
+        ParamNameSize / sizeof(wchar_t) + 1,
+        NULL,
+        NULL);
+    RasNdisWanPacketFragment.RoutingDomainID[wcslen(Buffer)] = '\0';
+
+    // Username
+    Desc.PropertyName = (unsigned long long)(L"RRASUserName");
+    Desc.ArrayIndex = ULONG_MAX;
+    (void)TdhGetPropertySize(ev, 0, NULL, 1, &Desc, &ParamNameSize);
+    Err = TdhGetProperty(ev, 0, NULL, 1, &Desc, sizeof(Buffer), (PBYTE)Buffer);
+    if (Err != NO_ERROR) {
+        Buffer[0] = L'\0';
+    }
+    Buffer[ParamNameSize / sizeof(wchar_t) + 1] = L'\0';
+    WideCharToMultiByte(CP_ACP,
+        0,
+        Buffer,
+        -1,
+        RasNdisWanPacketFragment.Username,
+        ParamNameSize / sizeof(wchar_t) + 1,
+        NULL,
+        NULL);
+    RasNdisWanPacketFragment.Username[wcslen(Buffer)] = '\0';
+
+    // Compute InterfacePreHashValue using the last part of RoutingDomainID.
+    char LastPartOfGuid[9];
+    memcpy(&LastPartOfGuid, &RasNdisWanPacketFragment.RoutingDomainID[29], sizeof(LastPartOfGuid));
+    LastPartOfGuid[8] = '\0';
+    RasNdisWanPacketFragment.InterfacePreHashValue = strtoul(LastPartOfGuid, NULL, 16);
 }
 
 void ParseVmSwitchPacketFragment(PEVENT_RECORD ev)
@@ -493,7 +1025,7 @@ void ParseVmSwitchPacketFragment(PEVENT_RECORD ev)
 void WINAPI EventCallback(PEVENT_RECORD ev)
 {
     int Err;
-    unsigned long LowerIfIndex;
+    unsigned long LowerIfIndex = NET_IFINDEX_UNSPECIFIED;
 
     struct INTERFACE* Iface;
     unsigned long FragLength;
@@ -506,47 +1038,68 @@ void WINAPI EventCallback(PEVENT_RECORD ev)
     PIPV4_HEADER Ipv4Hdr;
     PIPV6_HEADER Ipv6Hdr;
 
-    if (!IsEqualGUID(&ev->EventHeader.ProviderId, &NdisCapId) ||
-        (ev->EventHeader.EventDescriptor.Id != tidPacketFragment &&
-         ev->EventHeader.EventDescriptor.Id != tidPacketMetadata &&
-         ev->EventHeader.EventDescriptor.Id != tidVMSwitchPacketFragment)) {
+    BOOLEAN IsNdisCapEvent = IsEqualGUID(&ev->EventHeader.ProviderId, &NdisCapId) &&
+        (ev->EventHeader.EventDescriptor.Id == tidPacketFragment ||
+         ev->EventHeader.EventDescriptor.Id == tidPacketMetadata ||
+         ev->EventHeader.EventDescriptor.Id == tidVMSwitchPacketFragment);
+
+    BOOLEAN IsRasEvent = IsEqualGUID(&ev->EventHeader.ProviderId, &RasNdisWanCapId) &&
+        (ev->EventHeader.EventDescriptor.Id == tidRRasNdisWanSendPckts ||
+         ev->EventHeader.EventDescriptor.Id == tidRRasNdisWanRcvPckts);
+
+    if (!IsNdisCapEvent && !IsRasEvent) {
         return;
     }
 
-    CurrentPacketIsVMSwitchPacketFragment = (ev->EventHeader.EventDescriptor.Id == tidVMSwitchPacketFragment);
-    if (CurrentPacketIsVMSwitchPacketFragment) {
-        ParseVmSwitchPacketFragment(ev);
-    }
+    CurrentPacketIsVMSwitch = IsNdisCapEvent && (ev->EventHeader.EventDescriptor.Id == tidVMSwitchPacketFragment);
+    CurrentPacketIsRas = IsRasEvent;
 
-    Desc.PropertyName = (unsigned long long)L"LowerIfIndex";
-    Desc.ArrayIndex = ULONG_MAX;
-    Err = TdhGetProperty(ev, 0, NULL, 1, &Desc, sizeof(LowerIfIndex), (PBYTE)&LowerIfIndex);
-    if (Err != NO_ERROR) {
-        printf("TdhGetProperty LowerIfIndex failed with %u\n", Err);
-        return;
+    // NB: LowerIfIndex and MiniportIfIndex are not applicable for Ras captures,
+    // so for Ras packets we use NET_IFINDEX_UNSPECIFIED.
+
+    if (CurrentPacketIsRas) {
+        Type = PCAPNG_LINKTYPE_ETHERNET;
+        ParseRasNdisWanPacketFragment(ev);
+    } else {
+
+        if (!!(ev->EventHeader.EventDescriptor.Keyword & KW_MEDIA_NATIVE_802_11)) {
+            Type = PCAPNG_LINKTYPE_IEEE802_11;
+        } else if (!!(ev->EventHeader.EventDescriptor.Keyword & KW_MEDIA_WIRELESS_WAN)) {
+            Type = PCAPNG_LINKTYPE_RAW;
+        } else {
+            Type = PCAPNG_LINKTYPE_ETHERNET;
+        }
+
+        if (CurrentPacketIsVMSwitch) {
+            ParseVmSwitchPacketFragment(ev);
+        }
+
+        Desc.PropertyName = (unsigned long long)L"LowerIfIndex";
+        Desc.ArrayIndex = ULONG_MAX;
+        Err = TdhGetProperty(ev, 0, NULL, 1, &Desc, sizeof(LowerIfIndex), (PBYTE)&LowerIfIndex);
+        if (Err != NO_ERROR) {
+            printf("TdhGetProperty LowerIfIndex failed with %u\n", Err);
+            return;
+        }
     }
 
     Iface = GetInterface(LowerIfIndex);
 
-    if (!!(ev->EventHeader.EventDescriptor.Keyword & KW_MEDIA_NATIVE_802_11)) {
-        Type = PCAPNG_LINKTYPE_IEEE802_11;
-    } else if (!!(ev->EventHeader.EventDescriptor.Keyword & KW_MEDIA_WIRELESS_WAN)) {
-        Type = PCAPNG_LINKTYPE_RAW;
-    } else {
-        Type = PCAPNG_LINKTYPE_ETHERNET;
-    }
-
     if (!Pass2) {
         // Record the IfIndex if it's a new one.
         if (Iface == NULL) {
-            unsigned long MiniportIfIndex;
-            Desc.PropertyName = (unsigned long long)L"MiniportIfIndex";
-            Desc.ArrayIndex = ULONG_MAX;
-            Err = TdhGetProperty(ev, 0, NULL, 1, &Desc, sizeof(MiniportIfIndex), (PBYTE)&MiniportIfIndex);
-            if (Err != NO_ERROR) {
-                printf("TdhGetProperty MiniportIfIndex failed with %u\n", Err);
-                return;
+            unsigned long MiniportIfIndex = NET_IFINDEX_UNSPECIFIED;
+
+            if (!CurrentPacketIsRas) {
+                Desc.PropertyName = (unsigned long long)L"MiniportIfIndex";
+                Desc.ArrayIndex = ULONG_MAX;
+                Err = TdhGetProperty(ev, 0, NULL, 1, &Desc, sizeof(MiniportIfIndex), (PBYTE)&MiniportIfIndex);
+                if (Err != NO_ERROR) {
+                    printf("TdhGetProperty MiniportIfIndex failed with %u\n", Err);
+                    return;
+                }
             }
+
             AddInterface(
                 ev,
                 LowerIfIndex,
@@ -567,7 +1120,7 @@ void WINAPI EventCallback(PEVENT_RECORD ev)
     }
 
     // Save off Ndis/Wlan metadata to be added to the next packet
-    if (ev->EventHeader.EventDescriptor.Id == tidPacketMetadata) {
+    if (IsNdisCapEvent && ev->EventHeader.EventDescriptor.Id == tidPacketMetadata) {
         unsigned long MetadataLength = 0;
         Desc.PropertyName = (unsigned long long)L"MetadataSize";
         Desc.ArrayIndex = ULONG_MAX;
@@ -640,9 +1193,11 @@ void WINAPI EventCallback(PEVENT_RECORD ev)
     //
     // NB: Starting with Windows 8.1, only single-event packets are traced.
     // This logic is here to support packet captures from older systems.
+    //
+    // NB: This logic does not apply to events generated by Microsoft-Windows-Ras-NdisWanPacketCapture
+    // which don't use KW_PACKET_START and KW_PACKET_END keywords
 
-    if (!!(ev->EventHeader.EventDescriptor.Keyword & KW_PACKET_END)) {
-
+    if (!!(ev->EventHeader.EventDescriptor.Keyword & KW_PACKET_END) || CurrentPacketIsRas) {
         if (ev->EventHeader.EventDescriptor.Keyword & KW_MEDIA_NATIVE_802_11 &&
             AuxFragBuf[1] & 0x40) {
             // Clear Protected bit in the case of 802.11
@@ -656,13 +1211,14 @@ void WINAPI EventCallback(PEVENT_RECORD ev)
         char Comment[COMMENT_MAX_SIZE] = { 0 };
         size_t CommentLength = 0;
 
-        if (AddWlanMetadata) {
+        if (IsNdisCapEvent && AddWlanMetadata) {
             if (PacketMetadata.uPhyId > DOT11_PHY_TYPE_NAMES_MAX) {
                 PacketMetadata.uPhyId = 0; // Set to unknown if outside known bounds.
             }
 
-            Err = StringCchPrintfA(Comment, COMMENT_MAX_SIZE, "PID=%d Packet Metadata: ReceiveFlags:0x%x, PhyType:%s, CenterCh:%u, NumMPDUsReceived:%u, RSSI:%d, DataRate:%u",
+            Err = StringCchPrintfA(Comment, COMMENT_MAX_SIZE, "PID=%d TID=%d Packet Metadata: ReceiveFlags:0x%x, PhyType:%s, CenterCh:%u, NumMPDUsReceived:%u, RSSI:%d, DataRate:%u",
                 ev->EventHeader.ProcessId,
+                ev->EventHeader.ThreadId,
                 PacketMetadata.uReceiveFlags,
                 DOT11_PHY_TYPE_NAMES[PacketMetadata.uPhyId],
                 PacketMetadata.uChCenterFrequency,
@@ -672,10 +1228,11 @@ void WINAPI EventCallback(PEVENT_RECORD ev)
 
             AddWlanMetadata = FALSE;
             memset(&PacketMetadata, 0, sizeof(DOT11_EXTSTA_RECV_CONTEXT));
-        } else if (CurrentPacketIsVMSwitchPacketFragment) {
+        } else if (CurrentPacketIsVMSwitch) {
             if (VMSwitchPacketFragment.DestinationCount > 0) {
-                Err = StringCchPrintfA(Comment, COMMENT_MAX_SIZE, "PID=%d VlanId=%d SrcPortId=%d SrcNicType=%s SrcNicName=%s SrcPortName=%s DstNicCount=%d HashValue=%08lx",
+                Err = StringCchPrintfA(Comment, COMMENT_MAX_SIZE, "PID=%d TID=%d VlanId=%d SrcPortId=%d SrcNicType=%s SrcNicName=%s SrcPortName=%s DstNicCount=%d HashValue=%08lx",
                     ev->EventHeader.ProcessId,
+                    ev->EventHeader.ThreadId,
                     Iface->VlanId,
                     Iface->VMNic.SourcePortId,
                     Iface->VMNic.SourceNicType,
@@ -685,8 +1242,9 @@ void WINAPI EventCallback(PEVENT_RECORD ev)
                     VMSwitchPacketFragment.RssHashValue
                 );
             } else {
-                Err = StringCchPrintfA(Comment, COMMENT_MAX_SIZE, "PID=%d VlanId=%d SrcPortId=%d SrcNicType=%s SrcNicName=%s SrcPortName=%s HashValue=%08lx",
+                Err = StringCchPrintfA(Comment, COMMENT_MAX_SIZE, "PID=%d TID=%d VlanId=%d SrcPortId=%d SrcNicType=%s SrcNicName=%s SrcPortName=%s HashValue=%08lx",
                     ev->EventHeader.ProcessId,
+                    ev->EventHeader.ThreadId,
                     Iface->VlanId,
                     Iface->VMNic.SourcePortId,
                     Iface->VMNic.SourceNicType,
@@ -695,8 +1253,10 @@ void WINAPI EventCallback(PEVENT_RECORD ev)
                     VMSwitchPacketFragment.RssHashValue
                 );
             }
+        } else if (CurrentPacketIsRas) {
+            Err = StringCchPrintfA(Comment, COMMENT_MAX_SIZE, "PID=%d TID=%d RoutingDomainId=%s Username=%s", ev->EventHeader.ProcessId, ev->EventHeader.ThreadId, Iface->Ras.RoutingDomainID, Iface->Ras.Username);
         } else {
-            Err = StringCchPrintfA(Comment, COMMENT_MAX_SIZE, "PID=%d", ev->EventHeader.ProcessId);
+            Err = StringCchPrintfA(Comment, COMMENT_MAX_SIZE, "PID=%d TID=%d", ev->EventHeader.ProcessId, ev->EventHeader.ThreadId);
         }
 
         if (Err != NO_ERROR) {
@@ -722,7 +1282,7 @@ void WINAPI EventCallback(PEVENT_RECORD ev)
                     Ipv4Hdr = (PIPV4_HEADER)(EthHdr + 1);
                     InferredOriginalFragmentLength = ntohs(Ipv4Hdr->TotalLength) + sizeof(ETHERNET_HEADER);
                 } else if (ntohs(EthHdr->Type) == ETHERNET_TYPE_IPV6 &&
-                           TotalFragmentLength >= sizeof(IPV6_HEADER) + sizeof(ETHERNET_HEADER)) {
+                    TotalFragmentLength >= sizeof(IPV6_HEADER) + sizeof(ETHERNET_HEADER)) {
                     Ipv6Hdr = (PIPV6_HEADER)(EthHdr + 1);
                     InferredOriginalFragmentLength = ntohs(Ipv6Hdr->PayloadLength) + sizeof(IPV6_HEADER) + sizeof(ETHERNET_HEADER);
                 }
@@ -760,6 +1320,73 @@ void WINAPI EventCallback(PEVENT_RECORD ev)
     }
 }
 
+const GUID PktMonId = { // Microsoft-Windows-PktMon
+    0x4d4f80d9, 0xc8bd, 0x4d73, 0xbb, 0x5b, 0x19, 0xc9, 0x04, 0x02, 0xc5, 0xac};
+BOOLEAN TraceHasPktmonEvents = FALSE;
+
+void WINAPI CheckPktmonEventCallback(PEVENT_RECORD ev)
+{
+    if (IsEqualGUID(&ev->EventHeader.ProviderId, &PktMonId)) {
+        TraceHasPktmonEvents = TRUE;
+    }
+}
+
+int GetDefaultOutFileName(const wchar_t* InFilePath, wchar_t** DefaultOutFilePath)
+{
+    const size_t OutFileExtensionLength = ARRAYSIZE(DEFAULT_OUT_FILE_EXTENSION); // Character count of file extension including null terminator.
+    int Err = NO_ERROR;
+    size_t ResultBufferCapacity = 0;
+    wchar_t* ResultBuffer = NULL;
+    wchar_t* InFileExtensionStart = NULL;
+    size_t LengthWithoutExtension = 0;
+
+    *DefaultOutFilePath = NULL;
+
+    // Determine the length of the input file's path without its extension.
+    InFileExtensionStart = wcsrchr(InFilePath, L'.');
+    if (InFileExtensionStart != NULL) {
+        LengthWithoutExtension = InFileExtensionStart - InFilePath;
+    } else {
+        LengthWithoutExtension = wcslen(InFilePath);
+    }
+
+    ResultBufferCapacity = LengthWithoutExtension + OutFileExtensionLength;
+
+    // Allocate the output buffer.
+    ResultBuffer = malloc(ResultBufferCapacity * sizeof(ResultBuffer[0]));
+    if (ResultBuffer == NULL) {
+        Err = ERROR_NOT_ENOUGH_MEMORY;
+        goto Done;
+    }
+
+    // Copy input path without extension to output buffer.
+    Err = wcsncpy_s(ResultBuffer, ResultBufferCapacity, InFilePath, LengthWithoutExtension);
+    if (Err != NO_ERROR) {
+        printf("Copying input filename to buffer failed with %u\n", Err);
+        goto Done;
+    }
+
+    // Copy file extension to output buffer.
+    Err = wcscpy_s(ResultBuffer + LengthWithoutExtension,
+                   ResultBufferCapacity - LengthWithoutExtension,
+                   DEFAULT_OUT_FILE_EXTENSION);
+    if (Err != NO_ERROR) {
+        printf("Copying output file extension to buffer failed with %u\n", Err);
+        goto Done;
+    }
+
+    *DefaultOutFilePath = ResultBuffer;
+    ResultBuffer = NULL;
+
+Done:
+    if (ResultBuffer != NULL) {
+        free(ResultBuffer);
+        ResultBuffer = NULL;
+    }
+
+    return Err;
+}
+
 int __cdecl wmain(int argc, wchar_t** argv)
 {
     int Err;
@@ -767,6 +1394,7 @@ int __cdecl wmain(int argc, wchar_t** argv)
     TRACEHANDLE TraceHandle;
     wchar_t* InFileName;
     wchar_t* OutFileName;
+    wchar_t* DefaultOutFileName = NULL;
 
     if (argc == 2 &&
         (!wcscmp(argv[1], L"-v") ||
@@ -775,20 +1403,32 @@ int __cdecl wmain(int argc, wchar_t** argv)
         return 0;
     }
 
-    if (argc != 3) {
+    if (argc == 2) {
+        Err = GetDefaultOutFileName(argv[1], &DefaultOutFileName);
+        if (Err != NO_ERROR) {
+            printf("Creation of output filename failed with %u\n", Err);
+            goto Done;
+        }
+
+        OutFileName = DefaultOutFileName;
+    } else if (argc == 3) {
+        OutFileName = argv[2];
+    } else {
         printf(USAGE);
         return ERROR_INVALID_PARAMETER;
     }
-    InFileName = argv[1];
-    OutFileName = argv[2];
 
-    OutFile = CreateFile(OutFileName, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
+    InFileName = argv[1];
+
+    OutFile = CreateFile(OutFileName, GENERIC_WRITE | DELETE, 0, NULL, CREATE_ALWAYS,
                          FILE_ATTRIBUTE_NORMAL, NULL);
     if (OutFile == INVALID_HANDLE_VALUE) {
         Err = GetLastError();
         printf("CreateFile called on %ws failed with %u\n", OutFileName, Err);
         if (Err == ERROR_SHARING_VIOLATION) {
             printf("The file appears to be open already.\n");
+        } else if (Err == ERROR_PATH_NOT_FOUND) {
+            printf("The output file path may be too long.\n");
         }
         goto Done;
     }
@@ -830,15 +1470,52 @@ int __cdecl wmain(int argc, wchar_t** argv)
         goto Done;
     }
 
+    if (!FlushBufferBytes(OutFile)) {
+        Err = GetLastError();
+        printf("WriteFile failed with %u\n", Err);
+        goto Done;
+    }
+
     if (NumFramesConverted == 0) {
-        printf("Input ETL file does not contain a packet capture.\n");
+        printf("Input ETL file does not contain an ndiscap packet capture.\n");
+
+        // Check if user is mistakenly trying to use this tool to convert
+        // a pktmon pcap, so we can give them some advice.
+        CloseTrace(TraceHandle);
+        LogFile.EventRecordCallback = CheckPktmonEventCallback;
+        TraceHandle = OpenTrace(&LogFile);
+        if (TraceHandle == INVALID_PROCESSTRACE_HANDLE) {
+            Err = GetLastError();
+            printf("OpenTrace failed with %u\n", Err);
+            goto Done;
+        }
+        ProcessTrace(&TraceHandle, 1, 0, 0);
+        if (TraceHasPktmonEvents) {
+            printf("This file should be converted with pktmon, not etl2pcapng.\n");
+        }
+
+        // Mark the output file to be deleted once we close its handle.
+        FILE_DISPOSITION_INFO FdInfo = {TRUE};
+        if (!SetFileInformationByHandle(OutFile, FileDispositionInfo, &FdInfo, sizeof(FILE_DISPOSITION_INFO))) {
+            Err = GetLastError();
+            printf("SetFileInformationByHandle failed with %d\n", Err);
+            goto Done;
+        }
+
     } else {
-        printf("Converted %llu frames\n", NumFramesConverted);
+        printf("Wrote %llu frames to %ws\n", NumFramesConverted, OutFileName);
     }
 
 Done:
     if (OutFile != INVALID_HANDLE_VALUE) {
         CloseHandle(OutFile);
     }
+
+    if (DefaultOutFileName != NULL) {
+        free(DefaultOutFileName);
+        DefaultOutFileName = NULL;
+        OutFileName = NULL;
+    }
+
     return Err;
 }
